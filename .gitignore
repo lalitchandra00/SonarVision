@@ -1,0 +1,21 @@
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Generated predictions (regenerable)
+output/
+
+# Converted notebook scripts + inspection helpers (regenerable)
+scripts_temp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+yolov8n.pt
+
+
+
+# OS files
+Thumbs.db
+.DS_Store
