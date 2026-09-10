@@ -1,21 +1,70 @@
+# Model weights (large - store on Google Drive, not GitHub)
+
+
+*.pth
+*.pkl
+
+
+
+
+# Large dataset files
+*.zip
+*.tar.gz
+*.7z
+
+# Output (regenerable predictions)
+output/
+
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
-# Generated predictions (regenerable)
-output/
-
-# Converted notebook scripts + inspection helpers (regenerable)
-scripts_temp/
+# Training checkpoints
+backend/training_checkpoints
 
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
 .venv/
 venv/
-yolov8n.pt
+ENV/
+env/
 
-
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
 # OS files
 Thumbs.db
 .DS_Store
+._*
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# Converted notebook scripts (regenerable)
+scripts_temp/
