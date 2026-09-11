@@ -70,6 +70,20 @@ pip install -r requirements.txt
 
 Open any of the three prediction notebooks in `backend/predictions/` and run all cells. Place your inputs in the corresponding `input/` subdirectory first.
 
+### 4. Deploy the API to Render
+
+The repository includes `render.yaml` for a Render Python web service. In Render, choose **New > Blueprint** and select this repository. Render will install the main root `requirements.txt` and start FastAPI with `python -m uvicorn` on Render's assigned `$PORT`.
+
+After deployment, open the generated service URL followed by `/docs` to use Swagger UI. Frontends should send image files to:
+
+```text
+POST https://YOUR-SERVICE.onrender.com/predict/image
+POST https://YOUR-SERVICE.onrender.com/predict/video
+POST https://YOUR-SERVICE.onrender.com/predict/realtime
+```
+
+Send each file as multipart form field `file`. The response contains the boxed image in `annotated_image` and detections in `detections`.
+
 ---
 
 ## Datasets

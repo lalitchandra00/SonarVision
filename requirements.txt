@@ -1,8 +1,13 @@
 # SonarVision Requirements
-# Python 3.10 compatible - minimal set for backend/noise_filtering.ipynb
+# Main project requirements for the API and prediction pipeline.
 
 numpy
 opencv-python
 matplotlib
 requests
 tqdm
+fastapi
+uvicorn[standard]
+python-multipart
+ultralytics
+pyxtf
