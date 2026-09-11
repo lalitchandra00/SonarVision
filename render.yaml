@@ -9,3 +9,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: YOLO_CONFIG_DIR
+        value: /tmp/Ultralytics

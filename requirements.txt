@@ -10,5 +10,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 ultralytics
+onnx
 onnxruntime
 pyxtf
