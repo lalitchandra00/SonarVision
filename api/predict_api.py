@@ -21,6 +21,12 @@ Interactive docs: http://localhost:8000/docs
 
 from __future__ import annotations
 
+# Force headless matplotlib backend BEFORE anything else imports it.
+# Without this, importing matplotlib on a server without a display crashes
+# the entire process, causing 502/503 on all routes including /docs.
+import matplotlib
+matplotlib.use("Agg")
+
 import base64
 import logging
 import sys
@@ -55,9 +61,27 @@ IOU_MERGE = 0.35
 ALLOWED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 ALLOWED_VID_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 ALLOWED_LOG_EXTS = {".xtf", ".jsf"}
-IMAGE_OUTPUT_DIR = ROOT / "output" / "predictions" / "image_prediction"
-VIDEO_OUTPUT_DIR = ROOT / "output" / "predictions" / "video_prediction"
-REALTIME_OUTPUT_DIR = ROOT / "output" / "predictions" / "realtime_prediction" / "image"
+
+
+def _writable_output_dir(preferred: Path) -> Path:
+    """Return ``preferred`` if it is (or can be made) writable, otherwise
+    fall back to a sub-directory of /tmp.  Render's free tier mounts the
+    repo as read-only, so ``output/`` will not be writable there."""
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        test = preferred / ".write_test"
+        test.touch()
+        test.unlink()
+        return preferred
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "sonarvision" / preferred.name
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+IMAGE_OUTPUT_DIR = _writable_output_dir(ROOT / "output" / "predictions" / "image_prediction")
+VIDEO_OUTPUT_DIR = _writable_output_dir(ROOT / "output" / "predictions" / "video_prediction")
+REALTIME_OUTPUT_DIR = _writable_output_dir(ROOT / "output" / "predictions" / "realtime_prediction" / "image")
 
 # --------------------------------------------------------------------------
 # Model / noise-filter loading (same source of truth as the notebooks)
@@ -69,6 +93,7 @@ _CLASS_COLORS = {}
 _noise_ns = {}
 _model_lock = threading.Lock()
 _warm_thread = None
+_model_error: str | None = None  # set if warmup failed; surfaced in /health
 
 
 def _load_noise_filter_from_nb(nb_path: Path) -> dict:
@@ -145,7 +170,7 @@ def draw_boxes(img, boxes, label_map, class_colors, border_thick=4, text_scale=1
 
 
 def init_model():
-    global _model, _CLASS_NAMES, _CLASS_COLORS, _noise_ns
+    global _model, _CLASS_NAMES, _CLASS_COLORS, _noise_ns, _model_error
     if _model is not None:
         return
     with _model_lock:
@@ -163,7 +188,11 @@ def init_model():
                 best = cand
                 break
         if best is None:
-            raise RuntimeError("best.pt not found under backend/")
+            raise RuntimeError(
+                "best.pt / best.onnx not found under backend/. "
+                "Make sure the model weights are committed to the repo "
+                "(they must NOT be in .gitignore)."
+            )
 
         nf_nb = ROOT / "backend" / "noise_filtering.ipynb"
         if not nf_nb.exists():
@@ -175,12 +204,30 @@ def init_model():
         _CLASS_NAMES = _model.names
         _CLASS_COLORS = gen_colors(len(_CLASS_NAMES))
         _noise_ns = _load_noise_filter_from_nb(nf_nb)
+        _model_error = None
 
 
 def get_model():
+    """Return the loaded model, or raise 503 if warmup failed."""
     if _model is None:
+        if _model_error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Model not available: {_model_error}",
+            )
+        # Model is still loading in background thread — wait briefly
         init_model()
     return _model
+
+
+def _require_noise_ns():
+    """Raise 503 if the noise filter functions failed to load."""
+    if not _noise_ns:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Noise filter not loaded yet. Model warmup may have failed. Check /health.",
+        )
+    return _noise_ns
 
 
 # --------------------------------------------------------------------------
@@ -299,13 +346,26 @@ app.add_middleware(
 )
 
 
+def _warmup_safe():
+    """Wrapper around init_model that catches all exceptions so a missing
+    model file or bad notebook never kills the worker process.
+    The error is stored in _model_error and surfaced via /health."""
+    global _model_error
+    try:
+        init_model()
+        logger.info("Model loaded successfully.")
+    except Exception as exc:  # noqa: BLE001
+        _model_error = str(exc)
+        logger.error("Model warmup failed: %s", exc)
+
+
 def _start_warmup():
     """Kick off model loading in a background thread so the server accepts
     connections immediately and /health never blocks on model load."""
     global _warm_thread
     if _warm_thread is not None and _warm_thread.is_alive():
         return
-    _warm_thread = threading.Thread(target=init_model, name="model-warmup", daemon=True)
+    _warm_thread = threading.Thread(target=_warmup_safe, name="model-warmup", daemon=True)
     _warm_thread.start()
 
 
@@ -334,9 +394,11 @@ def root():
 
 @app.get("/health")
 def health():
+    """Always returns 200. Use model_loaded / model_error to check state."""
     return {
         "status": "ok",
         "model_loaded": _model is not None,
+        "model_error": _model_error,
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
     }
@@ -363,10 +425,11 @@ def predict_image(
     """Upload one image -> JSON with detections + original-size boxed PNG (base64)."""
     t0 = time.time()
     try:
+        ns = _require_noise_ns()
         raw = _read_upload(file.file.read(), file.filename or "", ALLOWED_IMG_EXTS, "image")
 
-        clean_orig = _noise_ns["filter_noise"](raw)
-        clean_sq = _noise_ns["preprocess_for_model"](raw)
+        clean_orig = ns["filter_noise"](raw)
+        clean_sq = ns["preprocess_for_model"](raw)
 
         res = get_model()(clean_sq, conf=conf, verbose=False)[0]
         boxes = _boxes_from_result(res)
@@ -377,7 +440,9 @@ def predict_image(
         annot = clean_orig.copy()
         if boxes:
             annot = draw_boxes(annot, boxes, _CLASS_NAMES, _CLASS_COLORS)
-        output_path = _save_annotated_image(annot, IMAGE_OUTPUT_DIR, "prediction.png")
+        # Use unique filename per request to avoid concurrent-request collisions
+        out_name = "prediction_{}.png".format(uuid.uuid4().hex[:8])
+        output_path = _save_annotated_image(annot, IMAGE_OUTPUT_DIR, out_name)
 
         return {
             "success": True,
@@ -398,7 +463,9 @@ def predict_image(
 
 def _predict_video_core(data: bytes, conf: float, suffix: str = ".mp4", output_dir: Path = VIDEO_OUTPUT_DIR) -> dict:
     t0 = time.time()
+    ns = _require_noise_ns()
     tmp = _save_upload(data, suffix)
+    cap = None
     try:
         cap = cv2.VideoCapture(str(tmp))
         if not cap.isOpened():
@@ -412,7 +479,7 @@ def _predict_video_core(data: bytes, conf: float, suffix: str = ".mp4", output_d
             if not ok:
                 break
             total += 1
-            clean = _noise_ns["filter_noise"](raw)
+            clean = ns["filter_noise"](raw)
             boxes = _boxes_from_result(get_model()(clean, conf=conf, verbose=False)[0])
             if boxes:
                 annot = draw_boxes(clean.copy(), boxes, _CLASS_NAMES, _CLASS_COLORS)
@@ -428,7 +495,6 @@ def _predict_video_core(data: bytes, conf: float, suffix: str = ".mp4", output_d
                     }
                 )
             frame_id += 1
-        cap.release()
         return {
             "success": True,
             "fps": round(float(fps), 2),
@@ -439,6 +505,9 @@ def _predict_video_core(data: bytes, conf: float, suffix: str = ".mp4", output_d
             "frames": frames,
         }
     finally:
+        # Always release the capture and clean temp file
+        if cap is not None:
+            cap.release()
         tmp.unlink(missing_ok=True)
 
 
@@ -508,8 +577,9 @@ def predict_log(
         tiles = make_tiles(waterfall, TILE_SIZE, TILE_OVERLAP)
         tile_images = []
 
+        ns = _require_noise_ns()
         for t in tiles:
-            tile_bgr = _noise_ns["preprocess_for_model"](t["tile"])
+            tile_bgr = ns["preprocess_for_model"](t["tile"])
             raw_boxes = _predict_tile(tile_bgr, conf)
             row0 = t["row0"]
             strip_boxes = []
@@ -577,17 +647,25 @@ def predict_log(
             )
         tiles_out.extend(tile_json)
 
+        def _cls_name(cls_id):
+            """Safe class name lookup whether _CLASS_NAMES is a dict or list."""
+            if isinstance(_CLASS_NAMES, dict):
+                return _CLASS_NAMES.get(cls_id, str(cls_id))
+            return _CLASS_NAMES[cls_id] if cls_id < len(_CLASS_NAMES) else str(cls_id)
+
         channels_out.append(
             {
                 "label": label,
                 "side": side,
-                "width": strip_h and waterfall.shape[1],
-                "height": strip_bgr.shape[0],
+                # Bug fix: 'strip_h and waterfall.shape[1]' was a boolean expression.
+                # waterfall.shape[1] is the actual column count of the original strip.
+                "width": int(waterfall.shape[1]),
+                "height": int(strip_bgr.shape[0]),
                 "overview_image": _data_uri(strip_bgr),
                 "detections": [
                     {
                         "class_id": m["cls"],
-                        "class": _CLASS_NAMES.get(m["cls"], str(m["cls"])),
+                        "class": _cls_name(m["cls"]),
                         "confidence": round(float(m["score"]), 4),
                         "bbox": {
                             "x1": round(float(m["x1"]), 2),

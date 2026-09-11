@@ -2,14 +2,17 @@
 # Main project requirements for the API and prediction pipeline.
 
 numpy
-opencv-python
+# Use headless OpenCV to avoid missing libGL.so.1 on Linux deploy servers
+opencv-python-headless
 matplotlib
 requests
 tqdm
 fastapi
 uvicorn[standard]
 python-multipart
-ultralytics
+# Use onnxruntime only (no heavy torch/torchvision) for ONNX model inference
 onnx
 onnxruntime
+# ultralytics is needed for YOLO class interface; torch pulled in separately
+ultralytics
 pyxtf
