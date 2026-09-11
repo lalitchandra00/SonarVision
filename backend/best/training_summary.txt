@@ -1,0 +1,9 @@
+SonarVision - YOLOv8s training summary
+date          : 2026-09-11 11:28:09.563115
+classes (id:name): [(0, 'pipe'), (1, 'shipwrecks'), (2, 'cylinder'), (3, 'ghostnet'), (4, 'plane'), (5, 'human')]
+num classes   : 6
+best epoch    : 88 (mAP50-95=0.6661, mAP50=0.8506)
+total epochs  : 100
+imgsz         : 640
+batch         : 80
+artifacts     : backend/best/best.pt, backend/best/best.onnx

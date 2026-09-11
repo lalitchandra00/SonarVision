@@ -2,10 +2,10 @@ task: detect
 mode: train
 model: /content/drive/MyDrive/SIH/SonarVision/backend/training_checkpoints/last.pt
 data: /content/sonar_work/dataset/data.yaml
-epochs: 120
+epochs: 100
 time: null
 patience: 30
-batch: 16
+batch: 40
 imgsz: 640
 save: true
 save_period: -1
