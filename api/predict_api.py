@@ -26,6 +26,7 @@ import logging
 import sys
 import tempfile
 import threading
+import re
 import time
 import uuid
 from pathlib import Path
@@ -71,16 +72,18 @@ _warm_thread = None
 
 
 def _load_noise_filter_from_nb(nb_path: Path) -> dict:
+    ns = {"__name__": "noise_filtering_mod", "cv2": cv2, "np": np, "Path": Path}
     import json
 
-    nb = json.loads(nb_path.read_text(encoding="utf-8"))
-    ns = {"__name__": "noise_filtering_mod", "cv2": cv2, "np": np, "Path": Path}
-    for cell in nb.get("cells", []):
+    notebook = json.loads(nb_path.read_text(encoding="utf-8"))
+    for cell in notebook.get("cells", []):
         if cell.get("cell_type") != "code":
             continue
         source = "".join(cell.get("source", []))
         if "def filter_noise" in source or "def preprocess_for_model" in source:
-            exec(source, ns)  # noqa: S102 - trusted notebook code
+            exec(source, ns)  # noqa: S102 - trusted repository notebook code
+    if "filter_noise" not in ns or "preprocess_for_model" not in ns:
+        raise RuntimeError("noise notebook did not define filter_noise and preprocess_for_model")
     return ns
 
 
