@@ -1,8 +1,10 @@
 # SonarVision Requirements
-# Main project requirements for the API and prediction pipeline.
+# Pure onnxruntime inference — no torch/ultralytics needed.
+# Total install size: ~350 MB  (vs ~2 GB with ultralytics+torch)
+# Safe for Render free tier (512 MB RAM).
 
 numpy
-# Use headless OpenCV to avoid missing libGL.so.1 on Linux deploy servers
+# Headless OpenCV — no libGL.so.1 needed on Linux servers
 opencv-python-headless
 matplotlib
 requests
@@ -10,9 +12,6 @@ tqdm
 fastapi
 uvicorn[standard]
 python-multipart
-# Use onnxruntime only (no heavy torch/torchvision) for ONNX model inference
-onnx
+# ONNX runtime for model inference (replaces ultralytics+torch)
 onnxruntime
-# ultralytics is needed for YOLO class interface; torch pulled in separately
-ultralytics
 pyxtf

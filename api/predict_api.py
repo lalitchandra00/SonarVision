@@ -122,6 +122,132 @@ def gen_colors(n):
     }
 
 
+# --------------------------------------------------------------------------
+# Pure onnxruntime YOLO inference  (no torch / ultralytics at runtime)
+# --------------------------------------------------------------------------
+
+class _Box:
+    """Minimal shim so _boxes_from_result works without changes."""
+    __slots__ = ("xyxy", "cls", "conf")
+
+    def __init__(self, x1: float, y1: float, x2: float, y2: float,
+                 class_id: int, confidence: float) -> None:
+        self.xyxy = [np.array([x1, y1, x2, y2], dtype=np.float32)]
+        self.cls  = [np.array(class_id,    dtype=np.float32)]
+        self.conf = [np.array(confidence,  dtype=np.float32)]
+
+
+class _Boxes:
+    """Iterable container of _Box objects."""
+    def __init__(self, box_list: list) -> None:
+        self._list = [_Box(**b) for b in box_list]
+
+    def __len__(self)  -> int:            return len(self._list)
+    def __iter__(self):                   return iter(self._list)
+    def __bool__(self) -> bool:           return bool(self._list)
+
+
+class _Result:
+    """Mimics the ultralytics result object returned by model()."""
+    def __init__(self, box_list: list) -> None:
+        self.boxes = _Boxes(box_list)
+
+
+class YOLOOnnx:
+    """Run a YOLOv8 ONNX model with onnxruntime — zero torch dependency.
+
+    Memory footprint: ~150 MB vs ~1.5 GB for ultralytics+torch.
+    Works on Render free tier (512 MB RAM).
+    """
+
+    def __init__(self, model_path: str) -> None:
+        import onnxruntime as ort
+        sess_opts = ort.SessionOptions()
+        sess_opts.inter_op_num_threads = 1
+        sess_opts.intra_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            str(model_path),
+            sess_options=sess_opts,
+            providers=["CPUExecutionProvider"],
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        inp_shape = self.session.get_inputs()[0].shape  # [1, 3, H, W]
+        self.ih = int(inp_shape[2]) if isinstance(inp_shape[2], int) else 640
+        self.iw = int(inp_shape[3]) if isinstance(inp_shape[3], int) else 640
+
+        # Extract class names stored in ONNX metadata by ultralytics exporter
+        meta = self.session.get_modelmeta().custom_metadata_map
+        if "names" in meta:
+            import ast
+            raw = meta["names"]
+            parsed = ast.literal_eval(raw)        # e.g. {0: 'mine', 1: 'wreck'}
+            self.names: dict = {int(k): str(v) for k, v in parsed.items()}
+        else:
+            # Fallback: infer class count from output shape [1, 4+nc, anchors]
+            out_shape = self.session.get_outputs()[0].shape
+            nc = max(int(out_shape[1]) - 4, 1)
+            self.names = {i: str(i) for i in range(nc)}
+
+    # ------------------------------------------------------------------
+    def __call__(self, img_bgr: np.ndarray,
+                 conf: float = 0.5,
+                 verbose: bool = False) -> list:
+        """Run inference; return [_Result] to match ultralytics interface."""
+        h0, w0 = img_bgr.shape[:2]
+
+        # Pre-process: resize → RGB → [0,1] → [1,3,H,W]
+        inp = cv2.resize(img_bgr, (self.iw, self.ih))
+        inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        inp = inp.transpose(2, 0, 1)[np.newaxis]          # [1, 3, H, W]
+
+        raw = self.session.run(None, {self.input_name: inp})[0]  # [1, 4+nc, 8400]
+        pred = raw[0]                                            # [4+nc, 8400]
+
+        # YOLOv8 output is [4+nc, 8400]; some exporters transpose it.
+        if pred.shape[0] < pred.shape[1]:
+            pred = pred.T                                         # → [8400, 4+nc]
+
+        cx, cy, pw, ph = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+        class_scores  = pred[:, 4:]                              # [8400, nc]
+        class_ids     = np.argmax(class_scores, axis=1)          # [8400]
+        confidences   = class_scores[np.arange(len(class_scores)), class_ids]
+
+        mask = confidences >= conf
+        if not mask.any():
+            return [_Result([])]
+
+        sx, sy = w0 / self.iw, h0 / self.ih
+        x1 = (cx[mask] - pw[mask] / 2) * sx
+        y1 = (cy[mask] - ph[mask] / 2) * sy
+        x2 = (cx[mask] + pw[mask] / 2) * sx
+        y2 = (cy[mask] + ph[mask] / 2) * sy
+        cls   = class_ids[mask]
+        confs = confidences[mask]
+
+        # NMS per class using cv2.dnn (available in opencv-python-headless)
+        boxes_out: list = []
+        for c in np.unique(cls):
+            idx  = cls == c
+            # cv2.dnn.NMSBoxes wants [x, y, w, h]
+            bx   = np.stack([x1[idx], y1[idx],
+                             x2[idx] - x1[idx], y2[idx] - y1[idx]], axis=1)
+            sc   = confs[idx].tolist()
+            keep = cv2.dnn.NMSBoxes(bx.tolist(), sc,
+                                    score_threshold=float(conf),
+                                    nms_threshold=0.45)
+            if len(keep) > 0:
+                keep = np.asarray(keep).flatten()
+                for k in keep:
+                    boxes_out.append({
+                        "x1": float(x1[idx][k]), "y1": float(y1[idx][k]),
+                        "x2": float(x2[idx][k]), "y2": float(y2[idx][k]),
+                        "class_id":   int(c),
+                        "confidence": float(confs[idx][k]),
+                    })
+
+        return [_Result(boxes_out)]
+
+
 def draw_boxes(img, boxes, label_map, class_colors, border_thick=4, text_scale=1.2, text_thick=3):
     """Draw vivid class-colored boxes with a larger, black-backed 'class conf%' label.
 
@@ -176,22 +302,23 @@ def init_model():
     with _model_lock:
         if _model is not None:
             return
-        from ultralytics import YOLO
 
-        best = None
+        # Use ONNX model with pure onnxruntime — no torch/ultralytics needed.
+        # This keeps memory ~150 MB (vs ~1.5 GB with torch) so it fits in
+        # Render's free-tier 512 MB container.
+        best_onnx = None
         for cand in (
             ROOT / "backend" / "best" / "best.onnx",
-            ROOT / "backend" / "best" / "best.pt",
-            ROOT / "backend" / "best.pt",
+            ROOT / "backend" / "best.onnx",
         ):
             if cand.exists():
-                best = cand
+                best_onnx = cand
                 break
-        if best is None:
+
+        if best_onnx is None:
             raise RuntimeError(
-                "best.pt / best.onnx not found under backend/. "
-                "Make sure the model weights are committed to the repo "
-                "(they must NOT be in .gitignore)."
+                "best.onnx not found under backend/best/. "
+                "Make sure the ONNX model is committed to the repo."
             )
 
         nf_nb = ROOT / "backend" / "noise_filtering.ipynb"
@@ -200,7 +327,7 @@ def init_model():
         if not nf_nb.exists():
             raise RuntimeError("noise_filtering.ipynb not found")
 
-        _model = YOLO(str(best))
+        _model = YOLOOnnx(str(best_onnx))
         _CLASS_NAMES = _model.names
         _CLASS_COLORS = gen_colors(len(_CLASS_NAMES))
         _noise_ns = _load_noise_filter_from_nb(nf_nb)
