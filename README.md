@@ -173,15 +173,12 @@ The training set is built from two paired Hugging Face sources. **`sonar_filtere
 
 | Dataset | URL | Size | Contents |
 |---------|-----|------|----------|
-| **Training images (filtered)** | [lalitchandra00/sonar_filtered_dataset](https://huggingface.co/datasets/lalitchandra00/sonar_filtered_dataset) | ~1.5 GB | `noise_filtered_training.zip` — pre-denoised train/val images (1334 + 33) |
+| **Training images (filtered)** | [lalitchandra00/sonar_filtered_dataset](https://huggingface.co/datasets/lalitchandra00/sonar_filtered_dataset) | ~1.5 GB | `noise_filtered_training.zip` — pre-denoised train/val images  |
 | **Labels** | [lalitchandra00/sonar_dataset](https://huggingface.co/datasets/lalitchandra00/sonar_dataset) | ~6 GB | `dataset_final.zip` — original images + YOLO `.txt` label files |
 
 Only the label `.txt` files are taken from `sonar_dataset`; all training images come from the noise-filtered set, matched 1-to-1 by filename. This pairing is produced by `backend/noise_filtering.ipynb`, whose `filter_archive_to()` denoises every image of `dataset_final.zip` into `noise_filtered_training/{train_filtered,val_filtered,test_filtered}/` — the release that is now stored on Hugging Face as `sonar_filtered_dataset`.
 
-| Split | Filtered images | Labels |
-|-------|-----------------|--------|
-| Train | 1334 | 1334 |
-| Val | 33 | 33 |
+
 
 The training notebooks verify 1-to-1 image↔label pairing and **derive the 6 class names from the label files themselves** (robust to any class ordering), then write `data.yaml` at runtime.
 
