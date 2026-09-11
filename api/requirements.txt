@@ -1,0 +1,8 @@
+# SonarVision Prediction API - runtime dependencies
+# Install with:  python -m pip install -r api/requirements.txt
+
+fastapi
+uvicorn[standard]
+python-multipart
+ultralytics
+pyxtf
