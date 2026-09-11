@@ -588,7 +588,13 @@ def predict_image(
         raise HTTPException(status_code=500, detail="image prediction failed: {}".format(exc)) from exc
 
 
-def _predict_video_core(data: bytes, conf: float, suffix: str = ".mp4", output_dir: Path = VIDEO_OUTPUT_DIR) -> dict:
+def _predict_video_core(
+    data: bytes,
+    conf: float,
+    suffix: str = ".mp4",
+    output_dir: Path = VIDEO_OUTPUT_DIR,
+    sample_interval: int = 1,          # 1 = every frame; N = every Nth frame
+) -> dict:
     t0 = time.time()
     ns = _require_noise_ns()
     tmp = _save_upload(data, suffix)
@@ -606,6 +612,10 @@ def _predict_video_core(data: bytes, conf: float, suffix: str = ".mp4", output_d
             if not ok:
                 break
             total += 1
+            # Skip frames that are not on the sample boundary
+            if (frame_id % sample_interval) != 0:
+                frame_id += 1
+                continue
             clean = ns["filter_noise"](raw)
             boxes = _boxes_from_result(get_model()(clean, conf=conf, verbose=False)[0])
             if boxes:
@@ -643,7 +653,11 @@ def predict_video(
     file: UploadFile = File(...),
     conf: float = Query(CONF_THRESHOLD, ge=0.01, le=1.0),
 ):
-    """Upload a video -> JSON with per-frame detections + boxed frame PNGs (only frames with detections)."""
+    """Upload a video -> JSON with per-frame detections + boxed frame PNGs (only frames with detections).
+
+    Samples 1 frame every 5 seconds to keep response times fast.
+    For a 30 fps video this means 1 frame every 150 frames.
+    """
     data = file.file.read()
     if len(data) == 0:
         raise HTTPException(status_code=400, detail="empty upload")
@@ -653,7 +667,23 @@ def predict_video(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"unsupported video type '{suffix}'; allowed: {sorted(ALLOWED_VID_EXTS)}",
         )
-    return _predict_video_core(data, conf, suffix, VIDEO_OUTPUT_DIR)
+
+    # Read just enough of the file to detect FPS before passing full data
+    # We write to a temp file to probe FPS, then reuse the same bytes.
+    tmp_probe = _save_upload(data, suffix)
+    try:
+        probe = cv2.VideoCapture(str(tmp_probe))
+        raw_fps = probe.get(cv2.CAP_PROP_FPS) if probe.isOpened() else 0.0
+        probe.release()
+    finally:
+        tmp_probe.unlink(missing_ok=True)
+
+    # Sample 1 frame every 5 seconds; fall back to every 150th frame if FPS unknown
+    fps = raw_fps if raw_fps and raw_fps > 0 else 30.0
+    sample_interval = max(1, int(round(fps * 5)))
+    logger.info("Video prediction: fps=%.2f  sample_interval=%d (1 frame / 5 s)", fps, sample_interval)
+
+    return _predict_video_core(data, conf, suffix, VIDEO_OUTPUT_DIR, sample_interval=sample_interval)
 
 
 @app.post("/predict/realtime")
