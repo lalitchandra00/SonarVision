@@ -147,7 +147,11 @@ def init_model():
         from ultralytics import YOLO
 
         best = None
-        for cand in (ROOT / "backend" / "best" / "best.pt", ROOT / "backend" / "best.pt"):
+        for cand in (
+            ROOT / "backend" / "best" / "best.onnx",
+            ROOT / "backend" / "best" / "best.pt",
+            ROOT / "backend" / "best.pt",
+        ):
             if cand.exists():
                 best = cand
                 break
