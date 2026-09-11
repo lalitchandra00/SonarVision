@@ -691,17 +691,52 @@ def predict_realtime(
     file: UploadFile = File(...),
     conf: float = Query(CONF_THRESHOLD, ge=0.01, le=1.0),
 ):
-    """Upload a captured clip (frontend webcam stream) -> boxed frame images + detections."""
-    data = file.file.read()
-    if len(data) == 0:
-        raise HTTPException(status_code=400, detail="empty upload")
-    suffix = Path(file.filename or "clip.webm").suffix.lower()
-    if suffix not in ALLOWED_VID_EXTS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"unsupported video type '{suffix}'; allowed: {sorted(ALLOWED_VID_EXTS)}",
-        )
-    return _predict_video_core(data, conf, suffix, REALTIME_OUTPUT_DIR)
+    """Receive a single image frame from the frontend webcam and return detections instantly.
+
+    The frontend captures one frame every few seconds and sends it here as an image.
+    This endpoint treats it exactly like /predict/image — one frame in, one prediction out.
+    Supported formats: .jpg, .jpeg, .png, .bmp, .webp
+    """
+    t0 = time.time()
+    try:
+        ns = _require_noise_ns()
+        data = file.file.read()
+        if len(data) == 0:
+            raise HTTPException(status_code=400, detail="empty upload")
+
+        raw = _read_upload(data, file.filename or "frame.jpg", ALLOWED_IMG_EXTS, "image frame")
+
+        clean_orig = ns["filter_noise"](raw)
+        clean_sq   = ns["preprocess_for_model"](raw)
+
+        res   = get_model()(clean_sq, conf=conf, verbose=False)[0]
+        boxes = _boxes_from_result(res)
+        sx    = clean_orig.shape[1] / clean_sq.shape[1]
+        sy    = clean_orig.shape[0] / clean_sq.shape[0]
+        boxes = _scale_boxes(boxes, sx, sy)
+
+        annot = clean_orig.copy()
+        if boxes:
+            annot = draw_boxes(annot, boxes, _CLASS_NAMES, _CLASS_COLORS)
+
+        out_name    = "realtime_{}.png".format(uuid.uuid4().hex[:8])
+        output_path = _save_annotated_image(annot, REALTIME_OUTPUT_DIR, out_name)
+
+        return {
+            "success":              True,
+            "width":                clean_orig.shape[1],
+            "height":               clean_orig.shape[0],
+            "conf_threshold":       conf,
+            "elapsed_ms":           round((time.time() - t0) * 1000, 1),
+            "detections":           _clean(boxes),
+            "annotated_image":      _data_uri(annot),
+            "annotated_image_path": output_path,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Realtime frame prediction failed for %s", file.filename)
+        raise HTTPException(status_code=500, detail="realtime prediction failed: {}".format(exc)) from exc
 
 
 @app.post("/predict/log")
