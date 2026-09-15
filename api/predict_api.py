@@ -8,9 +8,14 @@ single FastAPI service:
     POST /predict/realtime  - captured clip     -> boxed frame images (same core as video)
     POST /predict/log       - .xtf/.jsf log     -> boxed tiles + strip overviews + detections
 
-Every response is JSON with base64-encoded, already-drawn images: vivid
-per-class bounding boxes with a black-backed "class confidence%" label on the
-top-left of every box (matching the style used in the prediction notebooks).
+Every response is JSON with vivid per-class bounding boxes (black-backed
+"class confidence%" labels) already drawn on the images. The boxed images are
+stored locally and uploaded to Cloudinary; the JSON carries their secure URLs
+instead of base64 payloads.
+
+Cloudinary credentials are read from the environment (CLOUDINARY_URL or
+CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET, loaded from
+`<repo>/.env`). If they are missing, uploads are skipped and URLs are ``null``.
 
 Run:
     python -m uvicorn api.predict_api:app --host 0.0.0.0 --port 8000
@@ -27,23 +32,27 @@ from __future__ import annotations
 import matplotlib
 matplotlib.use("Agg")
 
-import base64
 import logging
+import os
 import sys
 import tempfile
 import threading
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
 ROOT = Path(__file__).resolve().parents[1]
 logger = logging.getLogger("sonarvision.api")
+
+load_dotenv(ROOT / ".env")
 
 sys.path.insert(0, str(ROOT))
 
@@ -74,6 +83,95 @@ IOU_MERGE = 0.35
 ALLOWED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 ALLOWED_VID_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 ALLOWED_LOG_EXTS = {".xtf", ".jsf"}
+
+# Cloudinary hosting: boxed images are uploaded here and the secure URLs are
+# returned in the JSON. Sub-folders mirror the input types (image/realtime/
+# video/logs). Credentials come from the environment (see module docstring).
+CLOUDINARY_FOLDER = "SonarVision"
+CLOUDINARY_UPLOAD_WORKERS = max(1, int(os.getenv("SONARVISION_UPLOAD_WORKERS", "8")))
+
+_cloudinary_lock = threading.Lock()
+_cloudinary_configured = False
+
+
+def _cloudinary_env_ready() -> bool:
+    """True when full Cloudinary credentials are present in the environment."""
+    return bool(
+        os.getenv("CLOUDINARY_URL")
+        or (
+            os.getenv("CLOUDINARY_CLOUD_NAME")
+            and os.getenv("CLOUDINARY_API_KEY")
+            and os.getenv("CLOUDINARY_API_SECRET")
+        )
+    )
+
+
+def _configure_cloudinary() -> None:
+    """Single-time lazy configuration of the cloudinary SDK (thread-safe)."""
+    global _cloudinary_configured
+    if _cloudinary_configured:
+        return
+    with _cloudinary_lock:
+        if _cloudinary_configured:
+            return
+        import cloudinary  # noqa: PLC0415 - lazy so import fails are surfaced by helper
+
+        cloudinary.config(
+            cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+            api_key=os.getenv("CLOUDINARY_API_KEY"),
+            api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        )
+        _cloudinary_configured = True
+
+
+def _upload_cloudinary(img_bgr: np.ndarray, public_id: str, folder: str) -> str | None:
+    """Upload one annotated image to Cloudinary; return its secure URL.
+
+    Returns ``None`` when credentials are missing or the upload fails
+    (prediction still succeeds; only the URL is null).
+    """
+    if not _cloudinary_env_ready():
+        return None
+    try:
+        _configure_cloudinary()
+        import cloudinary.uploader  # noqa: PLC0415
+
+        ok, buf = cv2.imencode(".png", img_bgr)
+        if not ok:
+            logger.warning("cloudinary: could not encode image %s", public_id)
+            return None
+        resp = cloudinary.uploader.upload(
+            buf.tobytes(),
+            folder=folder,
+            public_id=public_id,
+            overwrite=True,
+            resource_type="image",
+        )
+        return resp.get("secure_url")
+    except Exception as exc:  # noqa: BLE001 - one bad upload must not fail the request
+        logger.warning("cloudinary upload failed (%s): %s", public_id, exc)
+        return None
+
+
+def _upload_many(items: list, folder: str) -> dict:
+    """Upload several images in parallel; return ``{public_id: url_or_None}``.
+
+    ``items`` is a list of ``(public_id, img_bgr)`` tuples. All uploads run
+    concurrently so a request with many frames returns all URLs at once.
+    """
+    result: dict = {}
+    if not items:
+        return result
+    if not _cloudinary_env_ready():
+        return {pid: None for pid, _ in items}
+    with ThreadPoolExecutor(max_workers=CLOUDINARY_UPLOAD_WORKERS) as pool:
+        futures = {
+            pool.submit(_upload_cloudinary, img, pid, folder): pid
+            for pid, img in items
+        }
+        for fut, pid in futures.items():
+            result[pid] = fut.result()
+    return result
 
 
 def _effective_conf(conf: float) -> dict:
@@ -394,13 +492,6 @@ def _require_noise_ns():
 # Helpers
 # --------------------------------------------------------------------------
 
-def _data_uri(img_bgr) -> str:
-    ok, buf = cv2.imencode(".png", img_bgr)
-    if not ok:
-        raise HTTPException(status_code=500, detail="could not encode image")
-    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
-
-
 def _save_annotated_image(img_bgr, output_dir: Path, filename: str) -> str:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
@@ -585,7 +676,7 @@ def predict_image(
     file: UploadFile = File(...),
     conf: float = Query(CONF_THRESHOLD, ge=0.01, le=1.0),
 ):
-    """Upload one image -> JSON with detections + original-size boxed PNG (base64)."""
+    """Upload one image -> JSON with detections + boxed image hosted on Cloudinary."""
     t0 = time.time()
     try:
         ns = _require_noise_ns()
@@ -604,19 +695,21 @@ def predict_image(
         if boxes:
             annot = draw_boxes(annot, boxes, _CLASS_NAMES, _CLASS_COLORS)
         # Use unique filename per request to avoid concurrent-request collisions
-        out_name = "prediction_{}.png".format(uuid.uuid4().hex[:8])
-        output_path = _save_annotated_image(annot, IMAGE_OUTPUT_DIR, out_name)
+        img_token = uuid.uuid4().hex[:8]
+        out_name = "prediction_{}.png".format(img_token)
+        _save_annotated_image(annot, IMAGE_OUTPUT_DIR, out_name)
+        annotated_image_url = _upload_cloudinary(
+            annot, "prediction_" + img_token, CLOUDINARY_FOLDER + "/image"
+        )
 
         return {
             "success": True,
             "width": clean_orig.shape[1],
             "height": clean_orig.shape[0],
             "conf_threshold": conf,
-            "class_conf_thresholds": _effective_conf(conf),
             "elapsed_ms": round((time.time() - t0) * 1000, 1),
             "detections": _clean(boxes),
-            "annotated_image": _data_uri(annot),
-            "annotated_image_path": output_path,
+            "annotated_image_url": annotated_image_url,
         }
     except HTTPException:
         raise
@@ -643,6 +736,7 @@ def _predict_video_core(
         fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         total = 0
         frames = []
+        upload_items = []  # (public_id, img_bgr) uploaded in parallel after the loop
         frame_id = 0
         while True:
             ok, raw = cap.read()
@@ -659,25 +753,30 @@ def _predict_video_core(
             )
             if boxes:
                 annot = draw_boxes(clean.copy(), boxes, _CLASS_NAMES, _CLASS_COLORS)
-                output_path = _save_annotated_image(
-                    annot, output_dir, "frame_{:06d}.png".format(frame_id)
+                img_token = uuid.uuid4().hex[:8]
+                _save_annotated_image(
+                    annot, output_dir, "frame_{}_{:06d}.png".format(img_token, frame_id)
                 )
+                upload_items.append((f"frame_{img_token}_{frame_id:06d}", annot))
                 frames.append(
                     {
                         "frame_id": frame_id,
-                        "image": _data_uri(annot),
-                        "image_path": output_path,
+                        "image_url": None,  # filled after parallel upload
                         "detections": _clean(boxes),
                     }
                 )
             frame_id += 1
+
+        urls = _upload_many(upload_items, CLOUDINARY_FOLDER + "/video")
+        for entry, (pid, _) in zip(frames, upload_items):
+            entry["image_url"] = urls.get(pid)
+
         return {
             "success": True,
             "fps": round(float(fps), 2),
             "total_frames": total,
             "frames_with_detections": len(frames),
             "conf_threshold": conf,
-            "class_conf_thresholds": _effective_conf(conf),
             "elapsed_ms": round((time.time() - t0) * 1000, 1),
             "frames": frames,
         }
@@ -693,10 +792,10 @@ def predict_video(
     file: UploadFile = File(...),
     conf: float = Query(CONF_THRESHOLD, ge=0.01, le=1.0),
 ):
-    """Upload a video -> JSON with per-frame detections + boxed frame PNGs (only frames with detections).
+    """Upload a video -> one JSON with per-frame detections + Cloudinary URLs (only frames with detections).
 
-    Samples 1 frame every 5 seconds to keep response times fast.
-    For a 30 fps video this means 1 frame every 150 frames.
+    Samples 1 frame every 3 seconds to keep response times fast.
+    For a 30 fps video this means 1 frame every 90 frames.
     """
     data = file.file.read()
     if len(data) == 0:
@@ -718,10 +817,10 @@ def predict_video(
     finally:
         tmp_probe.unlink(missing_ok=True)
 
-    # Sample 1 frame every 5 seconds; fall back to every 150th frame if FPS unknown
+    # Sample 1 frame every 3 seconds; fall back to every 90th frame if FPS unknown
     fps = raw_fps if raw_fps and raw_fps > 0 else 30.0
-    sample_interval = max(1, int(round(fps * 5)))
-    logger.info("Video prediction: fps=%.2f  sample_interval=%d (1 frame / 5 s)", fps, sample_interval)
+    sample_interval = max(1, int(round(fps * 3)))
+    logger.info("Video prediction: fps=%.2f  sample_interval=%d (1 frame / 3 s)", fps, sample_interval)
 
     return _predict_video_core(data, conf, suffix, VIDEO_OUTPUT_DIR, sample_interval=sample_interval)
 
@@ -759,19 +858,21 @@ def predict_realtime(
         if boxes:
             annot = draw_boxes(annot, boxes, _CLASS_NAMES, _CLASS_COLORS)
 
-        out_name    = "realtime_{}.png".format(uuid.uuid4().hex[:8])
-        output_path = _save_annotated_image(annot, REALTIME_OUTPUT_DIR, out_name)
+        img_token   = uuid.uuid4().hex[:8]
+        out_name    = "realtime_{}.png".format(img_token)
+        _save_annotated_image(annot, REALTIME_OUTPUT_DIR, out_name)
+        annotated_image_url = _upload_cloudinary(
+            annot, "realtime_" + img_token, CLOUDINARY_FOLDER + "/realtime"
+        )
 
         return {
             "success":              True,
             "width":                clean_orig.shape[1],
             "height":               clean_orig.shape[0],
             "conf_threshold":       conf,
-            "class_conf_thresholds": _effective_conf(conf),
             "elapsed_ms":           round((time.time() - t0) * 1000, 1),
             "detections":           _clean(boxes),
-            "annotated_image":      _data_uri(annot),
-            "annotated_image_path": output_path,
+            "annotated_image_url":  annotated_image_url,
         }
     except HTTPException:
         raise
@@ -803,7 +904,14 @@ def predict_log(
 
     channels_out = []
     tiles_out = []
+    all_upload_items: list[tuple[str, np.ndarray]] = []
+    # Track (channel_index, public_id) for overviews so we can fill URLs later
+    overview_upload_map: list[tuple[int, str]] = []
+    # Track (tile_index_in_tiles_out, public_id) for tiles
+    tile_upload_map: list[tuple[int, str]] = []
+
     for label, ch in survey["channels"].items():
+        ch_idx = len(channels_out)
         waterfall = render_waterfall(ch["array"])
         side = ch["side"]
         channel_dets = []  # merged, strip coordinates
@@ -836,7 +944,6 @@ def predict_log(
 
         # boxed strip overview
         strip_bgr = cv2.cvtColor(waterfall, cv2.COLOR_GRAY2BGR)
-        strip_h = strip_bgr.shape[0]
         ch_boxes = [
             {"x1": m["x1"], "y1": m["y1"], "x2": m["x2"], "y2": m["y2"],
              "class_id": m["cls"], "confidence": m["score"]}
@@ -850,6 +957,11 @@ def predict_log(
                 (max(int(strip_bgr.shape[1] * s), 1), 3000),
                 interpolation=cv2.INTER_AREA,
             )
+
+        ov_token = uuid.uuid4().hex[:8]
+        ov_pid = "overview_{}_{}".format(ov_token, label)
+        all_upload_items.append((ov_pid, strip_bgr))
+        overview_upload_map.append((ch_idx, ov_pid))
 
         # boxed tiles
         tile_json = []
@@ -874,10 +986,15 @@ def predict_log(
                 {
                     "row0": t["row0"],
                     "row1": t["row1"],
-                    "image": _data_uri(tile_img),
+                    "image_url": None,  # filled after parallel upload
                     "detections": _clean(in_tile),
                 }
             )
+            tile_token = uuid.uuid4().hex[:8]
+            tile_pid = "tile_{}_{}".format(tile_token, row0)
+            all_upload_items.append((tile_pid, tile_img))
+            tile_upload_map.append((len(tiles_out) + len(tile_json) - 1, tile_pid))
+
         tiles_out.extend(tile_json)
 
         def _cls_name(cls_id):
@@ -890,11 +1007,9 @@ def predict_log(
             {
                 "label": label,
                 "side": side,
-                # Bug fix: 'strip_h and waterfall.shape[1]' was a boolean expression.
-                # waterfall.shape[1] is the actual column count of the original strip.
                 "width": int(waterfall.shape[1]),
                 "height": int(strip_bgr.shape[0]),
-                "overview_image": _data_uri(strip_bgr),
+                "overview_image_url": None,  # filled after parallel upload
                 "detections": [
                     {
                         "class_id": m["cls"],
@@ -912,11 +1027,18 @@ def predict_log(
             }
         )
 
+    urls = _upload_many(all_upload_items, CLOUDINARY_FOLDER + "/logs")
+
+    for ch_idx, ov_pid in overview_upload_map:
+        channels_out[ch_idx]["overview_image_url"] = urls.get(ov_pid)
+
+    for tile_idx, tile_pid in tile_upload_map:
+        tiles_out[tile_idx]["image_url"] = urls.get(tile_pid)
+
     return {
         "success": True,
         "survey_name": survey["name"],
         "conf_threshold": conf,
-        "class_conf_thresholds": _effective_conf(conf),
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "channels": channels_out,
         "tiles": tiles_out,

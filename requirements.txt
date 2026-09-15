@@ -15,3 +15,6 @@ python-multipart
 # ONNX runtime for model inference (replaces ultralytics+torch)
 onnxruntime
 pyxtf
+# Cloudinary image hosting (boxed predictions -> secure URLs)
+cloudinary
+python-dotenv

@@ -6,3 +6,5 @@ uvicorn[standard]
 python-multipart
 ultralytics
 pyxtf
+cloudinary
+python-dotenv
