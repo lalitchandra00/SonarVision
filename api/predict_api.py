@@ -55,12 +55,33 @@ from backend.sonar_ingest import (  # noqa: E402
 )
 
 CONF_THRESHOLD = 0.70
+
+# Per-class confidence thresholds. Effective threshold per class is
+# max(user conf, this class's configured value). Shipwrecks are kept at a high
+# bar (0.98) to avoid false alarms; everything else uses the normal 0.70.
+CLASS_CONF_THRESHOLDS = {
+    0: 0.70,  # pipe
+    1: 0.98,  # shipwrecks
+    2: 0.70,  # cylinder
+    3: 0.70,  # ghostnet
+    4: 0.70,  # plane
+    5: 0.70,  # human
+}
+
 TILE_SIZE = 1024
 TILE_OVERLAP = 128
 IOU_MERGE = 0.35
 ALLOWED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 ALLOWED_VID_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 ALLOWED_LOG_EXTS = {".xtf", ".jsf"}
+
+
+def _effective_conf(conf: float) -> dict:
+    """Per-class effective thresholds: max(user conf, configured default)."""
+    return {
+        c: max(conf, t)
+        for c, t in CLASS_CONF_THRESHOLDS.items()
+    }
 
 
 def _writable_output_dir(preferred: Path) -> Path:
@@ -191,8 +212,13 @@ class YOLOOnnx:
     # ------------------------------------------------------------------
     def __call__(self, img_bgr: np.ndarray,
                  conf: float = 0.5,
+                 class_conf: dict | None = None,
                  verbose: bool = False) -> list:
-        """Run inference; return [_Result] to match ultralytics interface."""
+        """Run inference; return [_Result] to match ultralytics interface.
+
+        ``class_conf`` is an optional per-class override map {class_id: min_conf}.
+        The effective threshold for a class is ``max(conf, class_conf[cls])``.
+        """
         h0, w0 = img_bgr.shape[:2]
 
         # Pre-process: resize → RGB → [0,1] → [1,3,H,W]
@@ -212,7 +238,14 @@ class YOLOOnnx:
         class_ids     = np.argmax(class_scores, axis=1)          # [8400]
         confidences   = class_scores[np.arange(len(class_scores)), class_ids]
 
-        mask = confidences >= conf
+        # Per-anchor threshold: base ``conf``, raised per class where configured.
+        thr = np.full(class_scores.shape[1], conf, dtype=np.float32)
+        if class_conf:
+            for c, t in class_conf.items():
+                if 0 <= int(c) < len(thr):
+                    thr[int(c)] = max(conf, t)
+
+        mask = confidences >= thr[class_ids]
         if not mask.any():
             return [_Result([])]
 
@@ -448,9 +481,9 @@ def _clean(result_boxes):
     ]
 
 
-def _predict_tile(tile_bgr, conf) -> list:
+def _predict_tile(tile_bgr, conf, class_conf=None) -> list:
     model = get_model()
-    res = model(tile_bgr, conf=conf, verbose=False)[0]
+    res = model(tile_bgr, conf=conf, class_conf=class_conf, verbose=False)[0]
     return _boxes_from_result(res)
 
 
@@ -515,6 +548,7 @@ def root():
         },
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
+        "class_conf_thresholds": _effective_conf(CONF_THRESHOLD),
         "model": str((ROOT / "backend").resolve()),
     }
 
@@ -528,6 +562,7 @@ def health():
         "model_error": _model_error,
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
+        "class_conf_thresholds": _effective_conf(CONF_THRESHOLD),
     }
 
 
@@ -541,6 +576,7 @@ def ready():
         "model_loaded": True,
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
+        "class_conf_thresholds": _effective_conf(CONF_THRESHOLD),
     }
 
 
@@ -558,7 +594,7 @@ def predict_image(
         clean_orig = ns["filter_noise"](raw)
         clean_sq = ns["preprocess_for_model"](raw)
 
-        res = get_model()(clean_sq, conf=conf, verbose=False)[0]
+        res = get_model()(clean_sq, conf=conf, class_conf=_effective_conf(conf), verbose=False)[0]
         boxes = _boxes_from_result(res)
         sx = clean_orig.shape[1] / clean_sq.shape[1]
         sy = clean_orig.shape[0] / clean_sq.shape[0]
@@ -576,6 +612,7 @@ def predict_image(
             "width": clean_orig.shape[1],
             "height": clean_orig.shape[0],
             "conf_threshold": conf,
+            "class_conf_thresholds": _effective_conf(conf),
             "elapsed_ms": round((time.time() - t0) * 1000, 1),
             "detections": _clean(boxes),
             "annotated_image": _data_uri(annot),
@@ -617,7 +654,9 @@ def _predict_video_core(
                 frame_id += 1
                 continue
             clean = ns["filter_noise"](raw)
-            boxes = _boxes_from_result(get_model()(clean, conf=conf, verbose=False)[0])
+            boxes = _boxes_from_result(
+                get_model()(clean, conf=conf, class_conf=_effective_conf(conf), verbose=False)[0]
+            )
             if boxes:
                 annot = draw_boxes(clean.copy(), boxes, _CLASS_NAMES, _CLASS_COLORS)
                 output_path = _save_annotated_image(
@@ -638,6 +677,7 @@ def _predict_video_core(
             "total_frames": total,
             "frames_with_detections": len(frames),
             "conf_threshold": conf,
+            "class_conf_thresholds": _effective_conf(conf),
             "elapsed_ms": round((time.time() - t0) * 1000, 1),
             "frames": frames,
         }
@@ -709,10 +749,10 @@ def predict_realtime(
         clean_orig = ns["filter_noise"](raw)
         clean_sq   = ns["preprocess_for_model"](raw)
 
-        res   = get_model()(clean_sq, conf=conf, verbose=False)[0]
+        res = get_model()(clean_sq, conf=conf, class_conf=_effective_conf(conf), verbose=False)[0]
         boxes = _boxes_from_result(res)
-        sx    = clean_orig.shape[1] / clean_sq.shape[1]
-        sy    = clean_orig.shape[0] / clean_sq.shape[0]
+        sx = clean_orig.shape[1] / clean_sq.shape[1]
+        sy = clean_orig.shape[0] / clean_sq.shape[0]
         boxes = _scale_boxes(boxes, sx, sy)
 
         annot = clean_orig.copy()
@@ -727,6 +767,7 @@ def predict_realtime(
             "width":                clean_orig.shape[1],
             "height":               clean_orig.shape[0],
             "conf_threshold":       conf,
+            "class_conf_thresholds": _effective_conf(conf),
             "elapsed_ms":           round((time.time() - t0) * 1000, 1),
             "detections":           _clean(boxes),
             "annotated_image":      _data_uri(annot),
@@ -772,7 +813,7 @@ def predict_log(
         ns = _require_noise_ns()
         for t in tiles:
             tile_bgr = ns["preprocess_for_model"](t["tile"])
-            raw_boxes = _predict_tile(tile_bgr, conf)
+            raw_boxes = _predict_tile(tile_bgr, conf, _effective_conf(conf))
             row0 = t["row0"]
             strip_boxes = []
             for b in raw_boxes:
@@ -875,6 +916,7 @@ def predict_log(
         "success": True,
         "survey_name": survey["name"],
         "conf_threshold": conf,
+        "class_conf_thresholds": _effective_conf(conf),
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "channels": channels_out,
         "tiles": tiles_out,
