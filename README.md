@@ -244,11 +244,11 @@ Reads `input/image/*`, runs `filter_noise → preprocess_for_model → YOLO`, dr
 
 ### Video prediction — `backend/predictions/video_prediction.ipynb`
 
-Frame-by-frame: noise-filter → predict (per-class thresholds applied via `keep_box`). A cleaned copy of the whole video goes to `output/noise_filter/.../videos/`; **only frames with detections** are saved as boxed PNGs to `output/predictions/video_prediction/`.
+Frame-by-frame: noise-filter → predict. A cleaned copy of the whole video goes to `output/noise_filter/.../videos/`; **only frames with detections** are saved as boxed PNGs to `output/predictions/video_prediction/`.
 
 ### Realtime prediction — `backend/predictions/realtime_prediction.ipynb`
 
-Live webcam detection for now (using webcam as drone proxy) with an inline side-by-side view (raw left / model view right). Frames are throttled to ~1 FPS (can be adjusted accordng to user), raw and noise-filtered copies are archived, detection frames are saved, and the loop stops after `RUN_SECONDS` or `stop_loop = True`. Detections are filtered with the same `keep_box` per-class thresholds.
+Live webcam detection for now (using webcam as drone proxy) with an inline side-by-side view (raw left / model view right). Frames are throttled to ~1 FPS (can be adjusted accordng to user), raw and noise-filtered copies are archived, detection frames are saved, and the loop stops after `RUN_SECONDS` or `stop_loop = True`.
 
 ### Log prediction — `backend/predictions/log_prediction.ipynb` (`.xtf` surveys) (work in progress for this file type, 70% - 80% is completed)
 

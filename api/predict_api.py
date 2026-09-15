@@ -639,7 +639,6 @@ def root():
         },
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
-        "class_conf_thresholds": _effective_conf(CONF_THRESHOLD),
         "model": str((ROOT / "backend").resolve()),
     }
 
@@ -653,7 +652,6 @@ def health():
         "model_error": _model_error,
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
-        "class_conf_thresholds": _effective_conf(CONF_THRESHOLD),
     }
 
 
@@ -667,7 +665,6 @@ def ready():
         "model_loaded": True,
         "classes": _CLASS_NAMES,
         "default_conf": CONF_THRESHOLD,
-        "class_conf_thresholds": _effective_conf(CONF_THRESHOLD),
     }
 
 
